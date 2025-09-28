@@ -1,0 +1,646 @@
+#!/usr/bin/bash
+
+# UGREEN NAS ZFS Pool and Disk Monitor
+# This script monitors ZFS pool status, disk health, scrub operations, and errors,
+# updating LED colors using ugreen_leds_cli accordingly.
+#
+# Author: GitHub Copilot
+# License: GPL-2.0-only (consistent with project)
+# Version: 1.0
+
+# ZFS-specific color scheme for LED status indicators:
+# Pool Status LEDs:
+#   - Green: ONLINE and healthy
+#   - Yellow: DEGRADED, scrub in progress, or minor issues
+#   - Red: FAULTED, UNAVAIL, or critical errors
+#   - Blue: Pool not imported or unknown status
+#   - Purple: Scrub completed with errors
+#   - Cyan: Resilver in progress
+# Individual Disk LEDs:
+#   - Green: ONLINE in pool
+#   - Yellow: Errors detected but still functioning
+#   - Red: FAULTED, OFFLINE, or failed disk
+#   - Blue: Not part of any pool
+#   - Off: No disk detected
+
+# Exit handler for cleanup
+exit_ugreen_zfs_monitor() {
+    if [[ -f "/var/run/ugreen-zfs-monitor.lock" ]]; then
+        rm "/var/run/ugreen-zfs-monitor.lock"
+    fi
+    # Turn all LEDs off on exit (optional)
+    if [[ "${TURN_OFF_LEDS_ON_EXIT}" == "true" ]]; then
+        "${UGREEN_LEDS_CLI}" all -off > /dev/null 2>&1
+    fi
+}
+
+# Setup exit trap
+trap 'exit_ugreen_zfs_monitor' EXIT INT TERM
+
+# Check if script is already running
+if [[ -f "/var/run/ugreen-zfs-monitor.lock" ]]; then
+    echo "ugreen-zfs-monitor already running!"
+    exit 1
+fi
+touch /var/run/ugreen-zfs-monitor.lock
+
+# Load configuration from environment and config file
+if [[ -f /etc/ugreen-zfs-monitor.conf ]]; then
+    source /etc/ugreen-zfs-monitor.conf
+elif [[ -f /etc/ugreen-leds.conf ]]; then
+    source /etc/ugreen-leds.conf
+fi
+
+# Default configuration values
+UGREEN_LEDS_CLI=${UGREEN_LEDS_CLI:="ugreen_leds_cli"}
+MONITOR_INTERVAL=${MONITOR_INTERVAL:=60}
+MONITOR_ZFS_POOLS=${MONITOR_ZFS_POOLS:=true}
+MONITOR_ZFS_DISKS=${MONITOR_ZFS_DISKS:=true}
+MONITOR_SCRUB_STATUS=${MONITOR_SCRUB_STATUS:=true}
+TURN_OFF_LEDS_ON_EXIT=${TURN_OFF_LEDS_ON_EXIT:=false}
+
+# ZFS monitoring configuration
+ZFS_POOLS=${ZFS_POOLS:=""}  # Auto-detect if empty
+POOL_STATUS_LED=${POOL_STATUS_LED:="power"}  # Use power LED for overall pool status
+NETWORK_LED=${NETWORK_LED:="netdev"}  # Use network LED for scrub/resilver status
+
+# LED colors (R G B format, 0-255 each)
+COLOR_ONLINE=${COLOR_ONLINE:="0 255 0"}          # Green - healthy
+COLOR_DEGRADED=${COLOR_DEGRADED:="255 255 0"}    # Yellow - degraded
+COLOR_FAULTED=${COLOR_FAULTED:="255 0 0"}        # Red - critical
+COLOR_UNAVAIL=${COLOR_UNAVAIL:="0 0 255"}        # Blue - unavailable
+COLOR_SCRUB_PROGRESS=${COLOR_SCRUB_PROGRESS:="128 0 255"}  # Purple - scrub with errors
+COLOR_RESILVER=${COLOR_RESILVER:="0 255 255"}    # Cyan - resilver in progress
+COLOR_SCRUB_ACTIVE=${COLOR_SCRUB_ACTIVE:="255 128 0"}  # Orange - active scrub
+COLOR_OFFLINE=${COLOR_OFFLINE:="64 64 64"}       # Gray - offline
+
+# Disk mapping configuration (same as original monitor)
+MAPPING_METHOD=${MAPPING_METHOD:=ata}
+led_map=(disk1 disk2 disk3 disk4 disk5 disk6 disk7 disk8)
+hctl_map=("0:0:0:0" "1:0:0:0" "2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "6:0:0:0" "7:0:0:0")
+serial_map=(${DISK_SERIAL})
+ata_map=("ata1" "ata2" "ata3" "ata4" "ata5" "ata6" "ata7" "ata8")
+
+# TrueNAS SCALE specific paths
+TRUENAS_SCALE_CLI_PATHS=(
+    "/usr/bin/ugreen_leds_cli"
+    "/usr/local/bin/ugreen_leds_cli" 
+    "/home/admin/ugreen_leds_cli"
+    "./cli/ugreen_leds_cli"
+    "$(dirname "$0")/../cli/ugreen_leds_cli"
+)
+
+# Device-specific mappings (same as original)
+if command -v dmidecode > /dev/null; then
+    product_name=$(dmidecode --string system-product-name 2>/dev/null)
+    case "${product_name}" in 
+        DXP6800*)
+            echo "Detected UGREEN DXP6800 series"
+            hctl_map=("2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "0:0:0:0" "1:0:0:0")
+            ata_map=("ata3" "ata4" "ata5" "ata6" "ata1" "ata2")
+            ;;
+        DX4600*|DX4700*|DXP2800*|DXP4800*|DXP8800*)
+            echo "Detected UGREEN ${product_name}"
+            ;;
+        *)
+            echo "Unknown/Generic UGREEN device - using default mappings"
+            ;;
+    esac
+fi
+
+# Function to find ugreen_leds_cli
+find_ugreen_leds_cli() {
+    if command -v "${UGREEN_LEDS_CLI}" > /dev/null 2>&1; then
+        return 0
+    fi
+    
+    for path in "${TRUENAS_SCALE_CLI_PATHS[@]}"; do
+        if [[ -f "${path}" ]] && [[ -x "${path}" ]]; then
+            UGREEN_LEDS_CLI="${path}"
+            echo "Found ugreen_leds_cli at: ${path}"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+if ! find_ugreen_leds_cli; then
+    echo "Error: ugreen_leds_cli not found"
+    echo "Please ensure ugreen_leds_cli is built and available"
+    exit 1
+fi
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: This script must be run as root (use sudo)"
+    exit 1
+fi
+
+# Check if ZFS is available
+if ! command -v zpool > /dev/null 2>&1; then
+    echo "Error: ZFS tools not found"
+    echo "Please install zfsutils-linux package"
+    exit 1
+fi
+
+# Auto-load i2c modules for TrueNAS SCALE
+load_i2c_modules() {
+    if ! lsmod | grep -q "i2c_dev"; then
+        modprobe i2c-dev 2>/dev/null || echo "Warning: Failed to load i2c-dev module"
+    fi
+}
+
+load_i2c_modules
+
+# Verify LED controller access
+if ! "${UGREEN_LEDS_CLI}" power > /dev/null 2>&1; then
+    echo "Warning: Cannot communicate with LED controller"
+    echo "LED updates will be skipped"
+    LED_AVAILABLE=false
+else
+    LED_AVAILABLE=true
+fi
+
+# Function to update LED color with error handling
+update_led() {
+    local led_name="$1"
+    local color="$2"
+    local brightness="${3:-255}"
+    
+    if [[ "${LED_AVAILABLE}" != "true" ]]; then
+        return 1
+    fi
+    
+    if ! "${UGREEN_LEDS_CLI}" "${led_name}" -color ${color} -brightness "${brightness}" -on > /dev/null 2>&1; then
+        echo "Warning: Failed to update ${led_name} LED"
+        return 1
+    fi
+    return 0
+}
+
+# Function to get ZFS pools
+get_zfs_pools() {
+    if [[ -n "${ZFS_POOLS}" ]]; then
+        echo "${ZFS_POOLS}"
+    else
+        # Auto-detect all imported pools
+        zpool list -H -o name 2>/dev/null | tr '\n' ' '
+    fi
+}
+
+# Function to check ZFS pool status
+check_zfs_pool_status() {
+    local pool="$1"
+    local status
+    local health
+    local scan_status=""
+    
+    # Get pool status
+    if ! zpool list -H -o name "${pool}" > /dev/null 2>&1; then
+        return 4  # Pool not found/imported
+    fi
+    
+    health=$(zpool list -H -o health "${pool}" 2>/dev/null)
+    status=$(zpool status "${pool}" 2>/dev/null)
+    
+    # Check for scrub/resilver operations
+    if echo "${status}" | grep -q "scrub in progress"; then
+        scan_status="scrub_active"
+    elif echo "${status}" | grep -q "resilver in progress"; then
+        scan_status="resilver"
+    elif echo "${status}" | grep -q "scrub repaired.*with.*errors"; then
+        scan_status="scrub_errors"
+    fi
+    
+    # Determine status based on health and operations
+    case "${health}" in
+        "ONLINE")
+            if [[ "${scan_status}" == "scrub_active" ]]; then
+                return 5  # Online but scrub active
+            elif [[ "${scan_status}" == "resilver" ]]; then
+                return 6  # Online but resilver active
+            elif [[ "${scan_status}" == "scrub_errors" ]]; then
+                return 7  # Online but scrub found errors
+            else
+                return 0  # Healthy
+            fi
+            ;;
+        "DEGRADED")
+            return 1  # Degraded
+            ;;
+        "FAULTED"|"UNAVAIL")
+            return 2  # Critical
+            ;;
+        *)
+            return 3  # Unknown
+            ;;
+    esac
+}
+
+# Function to get disk device path (same as original monitor)
+get_disk_device() {
+    local disk_index="$1"
+    local device=""
+    
+    case "${MAPPING_METHOD}" in
+        "ata")
+            local ata_name="${ata_map[$disk_index]}"
+            if [[ -n "${ata_name}" ]]; then
+                device=$(ls /sys/block/ 2>/dev/null | grep -E "^sd[a-z]+$" | while read -r dev; do
+                    if [[ -L "/sys/block/${dev}" ]] && readlink "/sys/block/${dev}" | grep -q "${ata_name}"; then
+                        echo "/dev/${dev}"
+                        break
+                    fi
+                done)
+            fi
+            ;;
+        "hctl")
+            local hctl="${hctl_map[$disk_index]}"
+            if [[ -n "${hctl}" ]]; then
+                device=$(lsblk -S -o HCTL,NAME 2>/dev/null | awk -v hctl="${hctl}" '$1==hctl {print "/dev/"$2}')
+            fi
+            ;;
+        "serial")
+            local serial="${serial_map[$disk_index]}"
+            if [[ -n "${serial}" ]]; then
+                device=$(lsblk -S -o SERIAL,NAME 2>/dev/null | awk -v serial="${serial}" '$1==serial {print "/dev/"$2}')
+            fi
+            ;;
+    esac
+    
+    echo "${device}"
+}
+
+# Function to check disk ZFS status
+check_disk_zfs_status() {
+    local device="$1"
+    local disk_name=$(basename "${device}")
+    
+    if [[ ! -b "${device}" ]]; then
+        return 4  # Device not found
+    fi
+    
+    # Find all pools and check if this disk is part of any
+    local pools
+    pools=$(zpool list -H -o name 2>/dev/null)
+    
+    local disk_status=""
+    local pool_found=false
+    
+    for pool in ${pools}; do
+        # Check if disk is part of this pool
+        local vdev_status
+        vdev_status=$(zpool status "${pool}" 2>/dev/null | grep -E "(${disk_name}|${device})" | awk '{print $2}' | head -1)
+        
+        if [[ -n "${vdev_status}" ]]; then
+            pool_found=true
+            disk_status="${vdev_status}"
+            break
+        fi
+    done
+    
+    if [[ "${pool_found}" != "true" ]]; then
+        return 3  # Not part of any ZFS pool
+    fi
+    
+    # Interpret ZFS disk status
+    case "${disk_status}" in
+        "ONLINE")
+            return 0  # Healthy
+            ;;
+        "DEGRADED")
+            return 1  # Warning
+            ;;
+        "FAULTED"|"OFFLINE"|"UNAVAIL"|"REMOVED")
+            return 2  # Critical
+            ;;
+        *)
+            return 3  # Unknown
+            ;;
+    esac
+}
+
+# Function to monitor ZFS pools
+monitor_zfs_pools() {
+    if [[ "${MONITOR_ZFS_POOLS}" != "true" ]]; then
+        return
+    fi
+    
+    local pools
+    pools=$(get_zfs_pools)
+    
+    if [[ -z "${pools}" ]]; then
+        echo "No ZFS pools found to monitor"
+        update_led "${POOL_STATUS_LED}" "${COLOR_UNAVAIL}"
+        return
+    fi
+    
+    local overall_status=0
+    local status_messages=()
+    
+    # Check each pool
+    for pool in ${pools}; do
+        local status_code
+        check_zfs_pool_status "${pool}"
+        status_code=$?
+        
+        case ${status_code} in
+            0)
+                status_messages+=("${pool}: ONLINE")
+                ;;
+            1)
+                status_messages+=("${pool}: DEGRADED")
+                if [[ ${overall_status} -lt 1 ]]; then overall_status=1; fi
+                ;;
+            2)
+                status_messages+=("${pool}: FAULTED")
+                overall_status=2
+                ;;
+            3)
+                status_messages+=("${pool}: UNKNOWN")
+                if [[ ${overall_status} -lt 1 ]]; then overall_status=3; fi
+                ;;
+            4)
+                status_messages+=("${pool}: NOT IMPORTED")
+                overall_status=2
+                ;;
+            5)
+                status_messages+=("${pool}: SCRUB ACTIVE")
+                if [[ ${overall_status} -lt 1 ]]; then overall_status=5; fi
+                ;;
+            6)
+                status_messages+=("${pool}: RESILVER ACTIVE")
+                if [[ ${overall_status} -lt 1 ]]; then overall_status=6; fi
+                ;;
+            7)
+                status_messages+=("${pool}: SCRUB FOUND ERRORS")
+                if [[ ${overall_status} -lt 1 ]]; then overall_status=7; fi
+                ;;
+        esac
+    done
+    
+    # Update pool status LED based on overall status
+    case ${overall_status} in
+        0)
+            update_led "${POOL_STATUS_LED}" "${COLOR_ONLINE}"
+            echo "ZFS Pools: All pools healthy"
+            ;;
+        1)
+            update_led "${POOL_STATUS_LED}" "${COLOR_DEGRADED}"
+            echo "ZFS Pools: Some pools degraded"
+            ;;
+        2)
+            update_led "${POOL_STATUS_LED}" "${COLOR_FAULTED}"
+            echo "ZFS Pools: Critical pool issues"
+            ;;
+        5)
+            update_led "${POOL_STATUS_LED}" "${COLOR_SCRUB_ACTIVE}"
+            echo "ZFS Pools: Scrub in progress"
+            ;;
+        6)
+            update_led "${POOL_STATUS_LED}" "${COLOR_RESILVER}"
+            echo "ZFS Pools: Resilver in progress"
+            ;;
+        7)
+            update_led "${POOL_STATUS_LED}" "${COLOR_SCRUB_PROGRESS}"
+            echo "ZFS Pools: Scrub completed with errors"
+            ;;
+        *)
+            update_led "${POOL_STATUS_LED}" "${COLOR_UNAVAIL}"
+            echo "ZFS Pools: Unknown status"
+            ;;
+    esac
+    
+    # Print detailed status
+    for msg in "${status_messages[@]}"; do
+        echo "  ${msg}"
+    done
+}
+
+# Function to monitor ZFS disk status
+monitor_zfs_disks() {
+    if [[ "${MONITOR_ZFS_DISKS}" != "true" ]]; then
+        return
+    fi
+    
+    local disk_index=0
+    
+    for led_name in "${led_map[@]}"; do
+        local device
+        device=$(get_disk_device ${disk_index})
+        
+        if [[ -z "${device}" ]]; then
+            # No disk in this slot - turn off LED
+            update_led "${led_name}" "${COLOR_OFFLINE}" 0
+            echo "Disk ${disk_index} (${led_name}): No disk detected"
+        else
+            local status_code
+            check_disk_zfs_status "${device}"
+            status_code=$?
+            
+            case ${status_code} in
+                0)
+                    # Healthy in pool
+                    update_led "${led_name}" "${COLOR_ONLINE}"
+                    echo "Disk ${disk_index} (${led_name}): ONLINE in pool - ${device}"
+                    ;;
+                1)
+                    # Degraded in pool
+                    update_led "${led_name}" "${COLOR_DEGRADED}"
+                    echo "Disk ${disk_index} (${led_name}): DEGRADED in pool - ${device}"
+                    ;;
+                2)
+                    # Faulted in pool
+                    update_led "${led_name}" "${COLOR_FAULTED}"
+                    echo "Disk ${disk_index} (${led_name}): FAULTED in pool - ${device}"
+                    ;;
+                3)
+                    # Not part of any pool
+                    update_led "${led_name}" "${COLOR_UNAVAIL}"
+                    echo "Disk ${disk_index} (${led_name}): Not in ZFS pool - ${device}"
+                    ;;
+                4)
+                    # Device not found
+                    update_led "${led_name}" "${COLOR_OFFLINE}" 0
+                    echo "Disk ${disk_index} (${led_name}): Device not found"
+                    ;;
+            esac
+        fi
+        
+        ((disk_index++))
+    done
+}
+
+# Function to monitor scrub/resilver status using network LED
+monitor_scrub_resilver() {
+    if [[ "${MONITOR_SCRUB_STATUS}" != "true" ]]; then
+        return
+    fi
+    
+    local pools
+    pools=$(get_zfs_pools)
+    
+    local scrub_active=false
+    local resilver_active=false
+    local scrub_errors=false
+    
+    for pool in ${pools}; do
+        local status
+        status=$(zpool status "${pool}" 2>/dev/null)
+        
+        if echo "${status}" | grep -q "scrub in progress"; then
+            scrub_active=true
+        elif echo "${status}" | grep -q "resilver in progress"; then
+            resilver_active=true
+        elif echo "${status}" | grep -q "scrub repaired.*with.*errors"; then
+            scrub_errors=true
+        fi
+    done
+    
+    # Update network LED for scrub/resilver status
+    if [[ "${resilver_active}" == "true" ]]; then
+        update_led "${NETWORK_LED}" "${COLOR_RESILVER}" 255
+        echo "Scrub/Resilver Status: Resilver in progress"
+    elif [[ "${scrub_active}" == "true" ]]; then
+        update_led "${NETWORK_LED}" "${COLOR_SCRUB_ACTIVE}" 255
+        echo "Scrub/Resilver Status: Scrub in progress"
+    elif [[ "${scrub_errors}" == "true" ]]; then
+        update_led "${NETWORK_LED}" "${COLOR_SCRUB_PROGRESS}" 255
+        echo "Scrub/Resilver Status: Recent scrub found errors"
+    else
+        update_led "${NETWORK_LED}" "${COLOR_ONLINE}" 128
+        echo "Scrub/Resilver Status: Normal"
+    fi
+}
+
+# Main monitoring loop
+main_loop() {
+    echo "Starting UGREEN ZFS monitoring..."
+    echo "Monitor interval: ${MONITOR_INTERVAL} seconds"
+    echo "Pool monitoring: ${MONITOR_ZFS_POOLS}"
+    echo "Disk monitoring: ${MONITOR_ZFS_DISKS}"
+    echo "Scrub monitoring: ${MONITOR_SCRUB_STATUS}"
+    echo "Press Ctrl+C to stop"
+    echo
+
+    while true; do
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "=== ZFS Monitor check at ${timestamp} ==="
+        
+        # Monitor ZFS pools
+        monitor_zfs_pools
+        
+        # Monitor ZFS disks
+        monitor_zfs_disks
+        
+        # Monitor scrub/resilver operations
+        monitor_scrub_resilver
+        
+        echo "Next check in ${MONITOR_INTERVAL} seconds"
+        echo
+        
+        # Wait for next iteration
+        sleep "${MONITOR_INTERVAL}"
+    done
+}
+
+# Help function
+show_help() {
+    cat << EOF
+UGREEN NAS ZFS Pool and Disk Monitor
+
+USAGE:
+    $0 [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -i, --interval SECONDS  Set monitoring interval (default: 60)
+    -p, --pools-only        Monitor pools only (not individual disks)
+    -d, --disks-only        Monitor disks only (not pool status)
+    -t, --test              Run one test cycle and exit
+    -c, --config FILE       Use specific config file
+
+ZFS MONITORING FEATURES:
+    - Pool health status (ONLINE, DEGRADED, FAULTED)
+    - Scrub and resilver progress monitoring
+    - Individual disk status in ZFS pools
+    - Error detection and reporting
+
+LED MAPPING:
+    Power LED:     Overall pool health status
+    Network LED:   Scrub/resilver operations status
+    Disk LEDs:     Individual disk status in pools
+
+COLOR SCHEME:
+    Green:   Healthy/Online
+    Yellow:  Degraded/Warning
+    Red:     Faulted/Critical
+    Blue:    Unavailable/Not in pool
+    Purple:  Scrub completed with errors
+    Cyan:    Resilver in progress
+    Orange:  Scrub in progress
+
+REQUIREMENTS:
+    - Root privileges (sudo)
+    - ugreen_leds_cli built and in PATH
+    - ZFS tools (zfsutils-linux)
+    - Active ZFS pools
+
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -i|--interval)
+            MONITOR_INTERVAL="$2"
+            shift 2
+            ;;
+        -p|--pools-only)
+            MONITOR_ZFS_POOLS=true
+            MONITOR_ZFS_DISKS=false
+            shift
+            ;;
+        -d|--disks-only)
+            MONITOR_ZFS_POOLS=false
+            MONITOR_ZFS_DISKS=true
+            shift
+            ;;
+        -t|--test)
+            echo "Running single ZFS test cycle..."
+            monitor_zfs_pools
+            monitor_zfs_disks
+            monitor_scrub_resilver
+            exit 0
+            ;;
+        -c|--config)
+            if [[ -f "$2" ]]; then
+                source "$2"
+            else
+                echo "Error: Config file $2 not found"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate configuration
+if [[ ! "${MONITOR_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${MONITOR_INTERVAL}" -lt 1 ]]; then
+    echo "Error: MONITOR_INTERVAL must be a positive integer"
+    exit 1
+fi
+
+# Start main monitoring loop
+main_loop
