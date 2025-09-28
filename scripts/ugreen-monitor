@@ -1,0 +1,589 @@
+#!/usr/bin/bash
+
+# UGREEN NAS Network and Disk Health Monitor
+# This script monitors network interfaces and disk S.M.A.R.T. status,
+# updating LED colors using ugreen_leds_cli accordingly.
+#
+# Author: GitHub Copilot
+# License: GPL-2.0-only (consistent with project)
+# Version: 1.0
+
+# Color scheme for LED status indicators:
+# Network LED:
+#   - Green: All interfaces up and healthy
+#   - Yellow: Some interfaces down but at least one up  
+#   - Red: All interfaces down or critical connectivity issues
+# Disk LEDs:
+#   - Green: Healthy S.M.A.R.T. status
+#   - Yellow: Warning condition (temperature, reallocated sectors, etc)
+#   - Red: Critical/failing status
+#   - Blue: No disk detected or S.M.A.R.T. unavailable
+#   - Off: Disabled monitoring for this slot
+
+# Exit handler for cleanup
+exit_ugreen_monitor() {
+    if [[ -f "/var/run/ugreen-monitor.lock" ]]; then
+        rm "/var/run/ugreen-monitor.lock"
+    fi
+    # Turn all LEDs off on exit (optional)
+    if [[ "${TURN_OFF_LEDS_ON_EXIT}" == "true" ]]; then
+        "${UGREEN_LEDS_CLI}" all -off > /dev/null 2>&1
+    fi
+}
+
+# Setup exit trap
+trap 'exit_ugreen_monitor' EXIT INT TERM
+
+# Check if script is already running
+if [[ -f "/var/run/ugreen-monitor.lock" ]]; then
+    echo "ugreen-monitor already running!"
+    exit 1
+fi
+touch /var/run/ugreen-monitor.lock
+
+# Load configuration from environment and config file
+if [[ -f /etc/ugreen-monitor.conf ]]; then
+    source /etc/ugreen-monitor.conf
+elif [[ -f /etc/ugreen-leds.conf ]]; then
+    source /etc/ugreen-leds.conf
+fi
+
+# Default configuration values
+UGREEN_LEDS_CLI=${UGREEN_LEDS_CLI:="ugreen_leds_cli"}
+MONITOR_INTERVAL=${MONITOR_INTERVAL:=30}
+MONITOR_NETWORK=${MONITOR_NETWORK:=true}
+MONITOR_DISKS=${MONITOR_DISKS:=true}
+TURN_OFF_LEDS_ON_EXIT=${TURN_OFF_LEDS_ON_EXIT:=false}
+
+# TrueNAS SCALE specific paths
+TRUENAS_SCALE_CLI_PATHS=(
+    "/usr/bin/ugreen_leds_cli"
+    "/usr/local/bin/ugreen_leds_cli" 
+    "/home/admin/ugreen_leds_cli"
+    "./cli/ugreen_leds_cli"
+    "$(dirname "$0")/../cli/ugreen_leds_cli"
+)
+
+# Network monitoring configuration
+NETWORK_INTERFACES=${NETWORK_INTERFACES:=""}  # Auto-detect if empty
+NETWORK_LED=${NETWORK_LED:="netdev"}
+PING_TARGET=${PING_TARGET:="8.8.8.8"}
+PING_COUNT=${PING_COUNT:=1}
+PING_TIMEOUT=${PING_TIMEOUT:=3}
+
+# LED colors (R G B format, 0-255 each)
+COLOR_HEALTHY=${COLOR_HEALTHY:="0 255 0"}        # Green
+COLOR_WARNING=${COLOR_WARNING:="255 255 0"}      # Yellow  
+COLOR_CRITICAL=${COLOR_CRITICAL:="255 0 0"}      # Red
+COLOR_OFFLINE=${COLOR_OFFLINE:="0 0 255"}        # Blue
+COLOR_DISABLED=${COLOR_DISABLED:="0 0 0"}        # Off
+
+# Disk mapping configuration (same as ugreen-diskiomon)
+MAPPING_METHOD=${MAPPING_METHOD:=ata}
+led_map=(disk1 disk2 disk3 disk4 disk5 disk6 disk7 disk8)
+hctl_map=("0:0:0:0" "1:0:0:0" "2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "6:0:0:0" "7:0:0:0")
+serial_map=(${DISK_SERIAL})
+ata_map=("ata1" "ata2" "ata3" "ata4" "ata5" "ata6" "ata7" "ata8")
+
+# Device-specific mappings
+if command -v dmidecode > /dev/null; then
+    product_name=$(dmidecode --string system-product-name 2>/dev/null)
+    case "${product_name}" in 
+        DXP6800*)
+            echo "Detected UGREEN DXP6800 series"
+            hctl_map=("2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "0:0:0:0" "1:0:0:0")
+            ata_map=("ata3" "ata4" "ata5" "ata6" "ata1" "ata2")
+            ;;
+        DX4600*)
+            echo "Detected UGREEN DX4600 series"
+            ;;
+        DX4700*)
+            echo "Detected UGREEN DX4700 series"
+            ;;
+        DXP2800*)
+            echo "Detected UGREEN DXP2800 series"
+            ;;
+        DXP4800*)
+            echo "Detected UGREEN DXP4800 series"
+            ;;
+        DXP8800*)
+            echo "Detected UGREEN DXP8800 series"
+            ;;
+        *)
+            echo "Unknown/Generic UGREEN device - using default mappings"
+            ;;
+    esac
+fi
+
+# Verify ugreen_leds_cli is available
+find_ugreen_leds_cli() {
+    # If already set and exists, use it
+    if command -v "${UGREEN_LEDS_CLI}" > /dev/null 2>&1; then
+        return 0
+    fi
+    
+    # Try to find ugreen_leds_cli in common TrueNAS SCALE locations
+    for path in "${TRUENAS_SCALE_CLI_PATHS[@]}"; do
+        if [[ -f "${path}" ]] && [[ -x "${path}" ]]; then
+            UGREEN_LEDS_CLI="${path}"
+            echo "Found ugreen_leds_cli at: ${path}"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+if ! find_ugreen_leds_cli; then
+    echo "Error: ugreen_leds_cli not found in any expected location"
+    echo "Searched paths:"
+    for path in "${TRUENAS_SCALE_CLI_PATHS[@]}"; do
+        echo "  - ${path}"
+    done
+    echo ""
+    echo "Please ensure ugreen_leds_cli is built and available:"
+    echo "  1. Build it: cd cli && make"
+    echo "  2. Copy to system: sudo cp ugreen_leds_cli /usr/local/bin/"
+    echo "  3. Or set UGREEN_LEDS_CLI=/full/path/to/ugreen_leds_cli"
+    exit 1
+fi
+
+# Verify we can access the LED controller
+echo "Testing LED controller communication..."
+if ! "${UGREEN_LEDS_CLI}" power > /dev/null 2>&1; then
+    echo "Error: Cannot communicate with LED controller"
+    echo ""
+    echo "Diagnostic information:"
+    echo "- ugreen_leds_cli path: ${UGREEN_LEDS_CLI}"
+    
+    # Check I2C devices
+    echo "- Available I2C adapters:"
+    i2cdetect -l 2>/dev/null || echo "  No I2C adapters found"
+    
+    echo "- I2C device scan (bus 1):"
+    i2cdetect -y 1 2>/dev/null || echo "  Cannot scan I2C bus 1"
+    
+    echo ""
+    echo "Common fixes:"
+    echo "  1. Ensure you're running as root: sudo $0"
+    echo "  2. Check I2C modules: lsmod | grep i2c"
+    echo "  3. Load I2C module: sudo modprobe i2c-dev"
+    echo "  4. Install I2C tools: sudo apt install i2c-tools"
+    echo "  5. Verify hardware connection and UGREEN device compatibility"
+    echo "  6. Check if led-ugreen kernel module is loaded (it conflicts): lsmod | grep led_ugreen"
+    echo "  7. If led-ugreen is loaded, unload it: sudo modprobe -r led_ugreen"
+    exit 1
+else
+    echo "LED controller communication successful!"
+fi
+
+# Function to update LED color with error handling
+update_led() {
+    local led_name="$1"
+    local color="$2"
+    local brightness="${3:-255}"
+    
+    if ! "${UGREEN_LEDS_CLI}" "${led_name}" -color ${color} -brightness "${brightness}" -on > /dev/null 2>&1; then
+        echo "Warning: Failed to update ${led_name} LED"
+        return 1
+    fi
+    return 0
+}
+
+# Function to get network interfaces
+get_network_interfaces() {
+    if [[ -n "${NETWORK_INTERFACES}" ]]; then
+        echo "${NETWORK_INTERFACES}"
+    else
+        # Auto-detect active network interfaces (exclude loopback, docker, etc.)
+        # Include bridge interfaces (br0) as they are important for network status
+        ip link show | grep -E '^[0-9]+: [^:]+' | \
+            grep -vE '(lo|docker|veth)' | \
+            grep -E '(eth|ens|enp|br[0-9])' | \
+            awk -F': ' '{print $2}' | \
+            awk '{print $1}'
+    fi
+}
+
+# Function to check network status
+check_network_status() {
+    local interfaces
+    local interface_count=0
+    local up_count=0
+    local bridge_up=false
+    local physical_up=false
+    local has_connectivity=false
+    
+    # Get list of interfaces to monitor
+    interfaces=$(get_network_interfaces)
+    
+    if [[ -z "${interfaces}" ]]; then
+        echo "No network interfaces found to monitor"
+        return 2  # No interfaces
+    fi
+    
+    # Check each interface
+    for interface in ${interfaces}; do
+        ((interface_count++))
+        
+        # Check if interface is up
+        if ip link show "${interface}" 2>/dev/null | grep -q "state UP"; then
+            ((up_count++))
+            
+            # Categorize interface type
+            if [[ "${interface}" =~ ^br[0-9] ]]; then
+                bridge_up=true
+                echo "Bridge interface ${interface} is UP"
+            else
+                physical_up=true
+                echo "Physical interface ${interface} is UP"
+            fi
+        else
+            echo "Interface ${interface} is DOWN"
+        fi
+    done
+    
+    # Test connectivity if at least one interface is up
+    if [[ ${up_count} -gt 0 ]] && [[ -n "${PING_TARGET}" ]]; then
+        if ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" "${PING_TARGET}" > /dev/null 2>&1; then
+            has_connectivity=true
+            echo "Connectivity test to ${PING_TARGET} successful"
+        else
+            echo "Connectivity test to ${PING_TARGET} failed"
+        fi
+    fi
+    
+    # Determine status with bridge-aware logic
+    # Good status if: bridge is up OR (any physical interface is up AND has connectivity)
+    if [[ "${bridge_up}" == "true" ]] || ([[ "${physical_up}" == "true" ]] && [[ "${has_connectivity}" == "true" ]]); then
+        return 0  # Healthy - either bridge is up or physical interfaces with connectivity
+    elif [[ ${up_count} -gt 0 ]]; then
+        return 1  # Warning - some interfaces up but no bridge or connectivity issues
+    else
+        return 2  # Critical - all interfaces down
+    fi
+}
+
+# Function to get disk device path based on mapping method
+get_disk_device() {
+    local disk_index="$1"
+    local device=""
+    
+    case "${MAPPING_METHOD}" in
+        "ata")
+            local ata_name="${ata_map[$disk_index]}"
+            if [[ -n "${ata_name}" ]]; then
+                # Find the block device for this ATA port
+                device=$(ls /sys/block/ 2>/dev/null | grep -E "^sd[a-z]+$" | while read -r dev; do
+                    if [[ -L "/sys/block/${dev}" ]] && readlink "/sys/block/${dev}" | grep -q "${ata_name}"; then
+                        echo "/dev/${dev}"
+                        break
+                    fi
+                done)
+            fi
+            ;;
+        "hctl")
+            local hctl="${hctl_map[$disk_index]}"
+            if [[ -n "${hctl}" ]]; then
+                device=$(lsblk -S -o HCTL,NAME 2>/dev/null | awk -v hctl="${hctl}" '$1==hctl {print "/dev/"$2}')
+            fi
+            ;;
+        "serial")
+            local serial="${serial_map[$disk_index]}"
+            if [[ -n "${serial}" ]]; then
+                device=$(lsblk -S -o SERIAL,NAME 2>/dev/null | awk -v serial="${serial}" '$1==serial {print "/dev/"$2}')
+            fi
+            ;;
+    esac
+    
+    echo "${device}"
+}
+
+# Function to check disk S.M.A.R.T. status
+check_disk_smart_status() {
+    local device="$1"
+    
+    if [[ ! -b "${device}" ]]; then
+        return 3  # Device not found
+    fi
+    
+    # Check if smartctl is available
+    if ! command -v smartctl > /dev/null 2>&1; then
+        echo "Warning: smartctl not found, install smartmontools package"
+        return 3
+    fi
+    
+    # Get S.M.A.R.T. status
+    local smart_output
+    smart_output=$(smartctl -H "${device}" 2>/dev/null)
+    local smart_exit_code=$?
+    
+    # Parse smartctl exit code (see smartctl man page)
+    # Bit 0 (1): Command line did not parse
+    # Bit 1 (2): Device open failed  
+    # Bit 2 (4): Some SMART command to disk failed
+    # Bit 3 (8): Disk failing (S.M.A.R.T. status)
+    # Bit 4 (16): Prefail attributes <= threshold
+    # Bit 5 (32): Attributes have changed
+    # Bit 6 (64): Error log contains errors
+    # Bit 7 (128): Self-test log contains errors
+    
+    if [[ $((smart_exit_code & 8)) -ne 0 ]] || [[ $((smart_exit_code & 16)) -ne 0 ]]; then
+        # Critical: disk failing or prefail attributes below threshold
+        return 2
+    elif [[ $((smart_exit_code & 64)) -ne 0 ]] || [[ $((smart_exit_code & 128)) -ne 0 ]]; then
+        # Warning: errors in logs or self-test
+        return 1
+    elif [[ $((smart_exit_code & 7)) -ne 0 ]]; then
+        # Cannot determine status (command/device issues)
+        return 3
+    elif echo "${smart_output}" | grep -q "PASSED"; then
+        # Healthy
+        return 0
+    else
+        # Unknown status
+        return 3
+    fi
+}
+
+# Function to monitor and update network LED
+monitor_network() {
+    if [[ "${MONITOR_NETWORK}" != "true" ]]; then
+        return
+    fi
+    
+    local status_code
+    check_network_status
+    status_code=$?
+    
+    case ${status_code} in
+        0)
+            # Healthy - green
+            update_led "${NETWORK_LED}" "${COLOR_HEALTHY}"
+            echo "Network: Healthy (bridge up or physical interfaces with connectivity)"
+            ;;
+        1)
+            # Warning - yellow  
+            update_led "${NETWORK_LED}" "${COLOR_WARNING}"
+            echo "Network: Warning (interfaces up but no bridge or connectivity issues)"
+            ;;
+        2)
+            # Critical - red
+            update_led "${NETWORK_LED}" "${COLOR_CRITICAL}"
+            echo "Network: Critical (all interfaces down)"
+            ;;
+        *)
+            # Unknown - blue
+            update_led "${NETWORK_LED}" "${COLOR_OFFLINE}"
+            echo "Network: Status unknown"
+            ;;
+    esac
+}
+
+# Function to monitor and update disk LEDs
+monitor_disks() {
+    if [[ "${MONITOR_DISKS}" != "true" ]]; then
+        return
+    fi
+    
+    local disk_index=0
+    
+    for led_name in "${led_map[@]}"; do
+        local device
+        device=$(get_disk_device ${disk_index})
+        
+        if [[ -z "${device}" ]]; then
+            # No disk in this slot - turn off LED
+            update_led "${led_name}" "${COLOR_DISABLED}" 0
+            echo "Disk ${disk_index} (${led_name}): No disk detected"
+        else
+            local status_code
+            check_disk_smart_status "${device}"
+            status_code=$?
+            
+            case ${status_code} in
+                0)
+                    # Healthy - green
+                    update_led "${led_name}" "${COLOR_HEALTHY}"
+                    echo "Disk ${disk_index} (${led_name}): Healthy - ${device}"
+                    ;;
+                1)
+                    # Warning - yellow
+                    update_led "${led_name}" "${COLOR_WARNING}"
+                    echo "Disk ${disk_index} (${led_name}): Warning - ${device}"
+                    ;;
+                2)
+                    # Critical - red  
+                    update_led "${led_name}" "${COLOR_CRITICAL}"
+                    echo "Disk ${disk_index} (${led_name}): Critical - ${device}"
+                    ;;
+                3)
+                    # Unknown/offline - blue
+                    update_led "${led_name}" "${COLOR_OFFLINE}"
+                    echo "Disk ${disk_index} (${led_name}): Unknown status - ${device}"
+                    ;;
+            esac
+        fi
+        
+        ((disk_index++))
+    done
+}
+
+# Main monitoring loop
+main_loop() {
+    echo "Starting UGREEN NAS monitoring..."
+    echo "Monitor interval: ${MONITOR_INTERVAL} seconds"
+    echo "Network monitoring: ${MONITOR_NETWORK}"
+    echo "Disk monitoring: ${MONITOR_DISKS}"
+    echo "Press Ctrl+C to stop"
+    echo
+
+    while true; do
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "=== Monitor check at ${timestamp} ==="
+        
+        # Monitor network
+        monitor_network
+        
+        # Monitor disks
+        monitor_disks
+        
+        echo "Next check in ${MONITOR_INTERVAL} seconds"
+        echo
+        
+        # Wait for next iteration
+        sleep "${MONITOR_INTERVAL}"
+    done
+}
+
+# Help function
+show_help() {
+    cat << EOF
+UGREEN NAS Network and Disk Health Monitor
+
+USAGE:
+    $0 [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -i, --interval SECONDS  Set monitoring interval (default: 30)
+    -n, --network-only      Monitor network only
+    -d, --disks-only        Monitor disks only
+    -t, --test              Run one test cycle and exit
+    -c, --config FILE       Use specific config file
+
+CONFIGURATION:
+    Configuration can be set via environment variables or /etc/ugreen-monitor.conf
+    
+    Key settings:
+        MONITOR_INTERVAL=30           # Seconds between checks
+        MONITOR_NETWORK=true          # Enable network monitoring  
+        MONITOR_DISKS=true            # Enable disk S.M.A.R.T. monitoring
+        UGREEN_LEDS_CLI="ugreen_leds_cli"  # Path to LED control tool
+        NETWORK_INTERFACES="eth0 eth1"     # Interfaces to monitor (auto if empty)
+        PING_TARGET="8.8.8.8"             # Connectivity test target
+
+LED COLOR SCHEME:
+    Green:  Healthy status
+    Yellow: Warning condition
+    Red:    Critical/failing status  
+    Blue:   Unknown/offline status
+    Off:    No device or disabled
+
+REQUIREMENTS:
+    - Root privileges (sudo)
+    - ugreen_leds_cli built and in PATH
+    - smartmontools package (for disk monitoring)
+    - i2c-dev kernel module loaded
+
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -i|--interval)
+            MONITOR_INTERVAL="$2"
+            shift 2
+            ;;
+        -n|--network-only)
+            MONITOR_NETWORK=true
+            MONITOR_DISKS=false
+            shift
+            ;;
+        -d|--disks-only)
+            MONITOR_NETWORK=false
+            MONITOR_DISKS=true
+            shift
+            ;;
+        -t|--test)
+            echo "Running single test cycle..."
+            monitor_network
+            monitor_disks
+            exit 0
+            ;;
+        -c|--config)
+            if [[ -f "$2" ]]; then
+                source "$2"
+            else
+                echo "Error: Config file $2 not found"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate configuration
+if [[ ! "${MONITOR_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${MONITOR_INTERVAL}" -lt 1 ]]; then
+    echo "Error: MONITOR_INTERVAL must be a positive integer"
+    exit 1
+fi
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: This script must be run as root (use sudo)"
+    exit 1
+fi
+
+# Auto-load i2c module for TrueNAS SCALE
+load_i2c_modules() {
+    echo "Loading I2C modules for TrueNAS SCALE..."
+    
+    # Load i2c-dev module
+    if ! lsmod | grep -q "i2c_dev"; then
+        if ! modprobe i2c-dev 2>/dev/null; then
+            echo "Warning: Failed to load i2c-dev module"
+            echo "You may need to install kernel modules or enable I2C support"
+        else
+            echo "Successfully loaded i2c-dev module"
+        fi
+    else
+        echo "i2c-dev module already loaded"
+    fi
+    
+    # Check if I2C tools are available
+    if ! command -v i2cdetect > /dev/null 2>&1; then
+        echo "Warning: i2c-tools not found, installing..."
+        apt update && apt install -y i2c-tools || echo "Failed to install i2c-tools"
+    fi
+    
+    # Give modules time to initialize
+    sleep 2
+}
+
+# Load I2C modules
+load_i2c_modules
+
+# Start main monitoring loop
+main_loop
