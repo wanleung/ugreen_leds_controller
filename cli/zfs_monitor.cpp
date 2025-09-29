@@ -308,7 +308,11 @@ void ZfsMonitor::parseConfigLine(const std::string& line) {
     if (key == "UGREEN_LEDS_CLI") {
         config_.ugreen_leds_cli_path = value;
     } else if (key == "MONITOR_INTERVAL") {
-        config_.monitor_interval = std::stoi(value);
+        try {
+            config_.monitor_interval = std::stoi(value);
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Invalid MONITOR_INTERVAL value '" << value << "', using default" << std::endl;
+        }
     } else if (key == "MONITOR_ZFS_POOLS") {
         config_.monitor_zfs_pools = (value == "true");
     } else if (key == "MONITOR_ZFS_DISKS") {
@@ -837,11 +841,15 @@ std::string ZfsMonitor::colorToString(const LedColor& color) const {
 LedColor ZfsMonitor::stringToColor(const std::string& color_str) const {
     std::vector<std::string> components = splitString(color_str, ' ');
     if (components.size() >= 3) {
-        return LedColor(
-            static_cast<uint8_t>(std::stoi(components[0])),
-            static_cast<uint8_t>(std::stoi(components[1])),
-            static_cast<uint8_t>(std::stoi(components[2]))
-        );
+        try {
+            return LedColor(
+                static_cast<uint8_t>(std::stoi(components[0])),
+                static_cast<uint8_t>(std::stoi(components[1])),
+                static_cast<uint8_t>(std::stoi(components[2]))
+            );
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Invalid color format '" << color_str << "', using black" << std::endl;
+        }
     }
     return LedColor(0, 0, 0);
 }
