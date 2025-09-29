@@ -1,5 +1,7 @@
 #include "zfs_monitor.h"
 #include "ugreen_leds.h"
+#include <iomanip>
+#include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -689,35 +691,35 @@ bool ZfsMonitor::updateLed(const std::string& led_name, const LedColor& color, u
     }
     
     try {
-        auto led_type = ugreen_leds_t::led_type_t::UGREEN_LED_POWER; // Default
+        ugreen_leds_t::led_type_t led_type = ugreen_leds_t::led_type_t::power; // Default
         
         // Map LED names to types (simplified mapping)
         if (led_name == "power") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_POWER;
+            led_type = ugreen_leds_t::led_type_t::power;
         } else if (led_name == "netdev") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_NETDEV;
+            led_type = ugreen_leds_t::led_type_t::netdev;
         } else if (led_name == "disk1") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK1;
+            led_type = ugreen_leds_t::led_type_t::disk1;
         } else if (led_name == "disk2") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK2;
+            led_type = ugreen_leds_t::led_type_t::disk2;
         } else if (led_name == "disk3") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK3;
+            led_type = ugreen_leds_t::led_type_t::disk3;
         } else if (led_name == "disk4") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK4;
+            led_type = ugreen_leds_t::led_type_t::disk4;
         } else if (led_name == "disk5") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK5;
+            led_type = ugreen_leds_t::led_type_t::disk5;
         } else if (led_name == "disk6") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK6;
+            led_type = ugreen_leds_t::led_type_t::disk6;
         } else if (led_name == "disk7") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK7;
+            led_type = ugreen_leds_t::led_type_t::disk7;
         } else if (led_name == "disk8") {
-            led_type = ugreen_leds_t::led_type_t::UGREEN_LED_DISK8;
+            led_type = ugreen_leds_t::led_type_t::disk8;
         }
         
         int result = led_controller_->set_rgb(led_type, color.r, color.g, color.b);
         if (result == 0) {
             led_controller_->set_brightness(led_type, brightness);
-            led_controller_->set_on(led_type);
+            led_controller_->set_onoff(led_type, 1);
         }
         
         return (result == 0);
@@ -734,20 +736,20 @@ bool ZfsMonitor::turnOffAllLeds() {
     
     // Turn off all LEDs
     std::vector<ugreen_leds_t::led_type_t> all_leds = {
-        ugreen_leds_t::led_type_t::UGREEN_LED_POWER,
-        ugreen_leds_t::led_type_t::UGREEN_LED_NETDEV,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK1,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK2,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK3,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK4,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK5,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK6,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK7,
-        ugreen_leds_t::led_type_t::UGREEN_LED_DISK8
+        ugreen_leds_t::led_type_t::power,
+        ugreen_leds_t::led_type_t::netdev,
+        ugreen_leds_t::led_type_t::disk1,
+        ugreen_leds_t::led_type_t::disk2,
+        ugreen_leds_t::led_type_t::disk3,
+        ugreen_leds_t::led_type_t::disk4,
+        ugreen_leds_t::led_type_t::disk5,
+        ugreen_leds_t::led_type_t::disk6,
+        ugreen_leds_t::led_type_t::disk7,
+        ugreen_leds_t::led_type_t::disk8
     };
     
     for (auto led : all_leds) {
-        led_controller_->set_off(led);
+        led_controller_->set_onoff(led, 0);
     }
     
     return true;
