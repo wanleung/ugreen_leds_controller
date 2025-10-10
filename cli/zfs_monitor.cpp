@@ -125,10 +125,37 @@ ZfsPoolInfo ZfsCommandExecutor::getPoolInfo(const std::string& pool_name) {
     } else if (status_output.find("scrub repaired") != std::string::npos && 
                status_output.find("with") != std::string::npos && 
                status_output.find("errors") != std::string::npos) {
-        info.scrub_errors = true;
-        if (info.health == ZfsPoolHealth::ONLINE) {
-            info.health = ZfsPoolHealth::SCRUB_ERRORS;
+        
+        // Parse the scrub line to check if actual data was repaired or errors were found
+        std::istringstream stream(status_output);
+        std::string line;
+        bool found_actual_errors = false;
+        
+        while (std::getline(stream, line)) {
+            if (line.find("scrub repaired") != std::string::npos) {
+                // Look for patterns like "repaired 0B" (no errors) vs "repaired 123KB" (actual repairs)
+                if (line.find("repaired 0B") == std::string::npos) {
+                    // Non-zero repair amount indicates actual errors were found and fixed
+                    found_actual_errors = true;
+                    break;
+                }
+                // Also check for explicit error count
+                if (line.find("with 0 errors") == std::string::npos && 
+                    line.find("errors") != std::string::npos) {
+                    // Non-zero error count
+                    found_actual_errors = true;
+                    break;
+                }
+            }
         }
+        
+        if (found_actual_errors) {
+            info.scrub_errors = true;
+            if (info.health == ZfsPoolHealth::ONLINE) {
+                info.health = ZfsPoolHealth::SCRUB_ERRORS;
+            }
+        }
+        // If scrub repaired 0B with 0 errors, this is actually healthy - don't flag as error
     }
     
     return info;
@@ -897,10 +924,10 @@ void ZfsMonitor::monitorScrubResilver() {
         status_desc = "Scrub in progress";
     } else if (scrub_errors) {
         color = config_.color_scrub_progress;
-        status_desc = "Recent scrub found errors";
+        status_desc = "Recent scrub found and repaired errors";
     } else {
         color = LedColor(config_.color_online.r, config_.color_online.g, config_.color_online.b);
-        status_desc = "Normal";
+        status_desc = "All pools healthy";
     }
     
     updateLed(config_.network_led, color, scrub_active || resilver_active ? 255 : 128);
