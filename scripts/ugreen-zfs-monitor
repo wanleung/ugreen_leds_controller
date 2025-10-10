@@ -1,4 +1,11 @@
-#!/usr/bin/bash
+#!/bin/bash
+
+# Ensure this script is running with bash (not sh or other shells)
+if [ -z "$BASH_VERSION" ]; then
+    echo "Error: This script requires bash to run properly."
+    echo "Please run with: bash $0 $*"
+    exit 1
+fi
 
 # UGREEN NAS ZFS Pool and Disk Monitor
 # This script monitors ZFS pool status, disk health, scrub operations, and errors,
@@ -272,6 +279,95 @@ get_disk_device() {
     echo "${device}"
 }
 
+# Function to resolve ZFS disk identifiers to actual devices
+resolve_zfs_disk_identifier() {
+    local zfs_identifier="$1"
+    
+    # If it's already a /dev/sd* device, return as-is
+    if [[ "${zfs_identifier}" =~ ^/dev/sd[a-z]+$ ]]; then
+        echo "${zfs_identifier}"
+        return
+    fi
+    
+    # If it's just sdX without /dev/, add it
+    if [[ "${zfs_identifier}" =~ ^sd[a-z]+$ ]]; then
+        echo "/dev/${zfs_identifier}"
+        return
+    fi
+    
+    # Try to resolve by-id, by-uuid, or other symlinks
+    local real_device=""
+    
+    # Check if it's a by-id identifier
+    if [[ "${zfs_identifier}" =~ ^(ata-|wwn-|scsi-) ]]; then
+        if [[ -L "/dev/disk/by-id/${zfs_identifier}" ]]; then
+            real_device=$(readlink -f "/dev/disk/by-id/${zfs_identifier}")
+        fi
+    # Check if it's a partition (ends with number)
+    elif [[ "${zfs_identifier}" =~ [0-9]+$ ]]; then
+        # Strip the partition number and try to find the base device
+        local base_name="${zfs_identifier%[0-9]*}"
+        if [[ -b "/dev/${base_name}" ]]; then
+            real_device="/dev/${base_name}"
+        elif [[ -b "${base_name}" ]]; then
+            real_device="${base_name}"
+        fi
+    # Check if it's in /dev/disk/by-uuid
+    elif [[ -L "/dev/disk/by-uuid/${zfs_identifier}" ]]; then
+        real_device=$(readlink -f "/dev/disk/by-uuid/${zfs_identifier}")
+        # If it's a partition, get the base device
+        if [[ "${real_device}" =~ [0-9]+$ ]]; then
+            real_device="${real_device%[0-9]*}"
+        fi
+    # Try as a full path
+    elif [[ -b "${zfs_identifier}" ]]; then
+        real_device="${zfs_identifier}"
+    fi
+    
+    # Return the resolved device or empty if not found
+    echo "${real_device}"
+}
+
+# Function to find ZFS disk identifiers for a device
+find_zfs_identifiers_for_device() {
+    local device="$1"
+    local identifiers=()
+    
+    # Add the device itself
+    identifiers+=("$(basename "${device}")")
+    identifiers+=("${device}")
+    
+    # Find all symlinks that point to this device
+    for link_dir in /dev/disk/by-id /dev/disk/by-uuid /dev/disk/by-path; do
+        if [[ -d "${link_dir}" ]]; then
+            for link in "${link_dir}"/*; do
+                if [[ -L "${link}" ]] && [[ "$(readlink -f "${link}")" == "${device}"* ]]; then
+                    identifiers+=("$(basename "${link}")")
+                    identifiers+=("${link}")
+                fi
+            done
+        fi
+    done
+    
+    # Also check for partitions of this device
+    for part in "${device}"[0-9]*; do
+        if [[ -b "${part}" ]]; then
+            identifiers+=("$(basename "${part}")")
+            for link_dir in /dev/disk/by-id /dev/disk/by-uuid /dev/disk/by-path; do
+                if [[ -d "${link_dir}" ]]; then
+                    for link in "${link_dir}"/*; do
+                        if [[ -L "${link}" ]] && [[ "$(readlink -f "${link}")" == "${part}" ]]; then
+                            identifiers+=("$(basename "${link}")")
+                        fi
+                    done
+                fi
+            done
+        fi
+    done
+    
+    printf '%s\n' "${identifiers[@]}"
+}
+
 # Function to check disk ZFS status
 check_disk_zfs_status() {
     local device="$1"
@@ -281,6 +377,10 @@ check_disk_zfs_status() {
         return 4  # Device not found
     fi
     
+    # Find all possible identifiers for this device
+    local identifiers
+    mapfile -t identifiers < <(find_zfs_identifiers_for_device "${device}")
+    
     # Find all pools and check if this disk is part of any
     local pools
     pools=$(zpool list -H -o name 2>/dev/null)
@@ -289,15 +389,23 @@ check_disk_zfs_status() {
     local pool_found=false
     
     for pool in ${pools}; do
-        # Check if disk is part of this pool
-        local vdev_status
-        vdev_status=$(zpool status "${pool}" 2>/dev/null | grep -E "(${disk_name}|${device})" | awk '{print $2}' | head -1)
+        # Get the full zpool status output
+        local zpool_output
+        zpool_output=$(zpool status "${pool}" 2>/dev/null)
         
-        if [[ -n "${vdev_status}" ]]; then
-            pool_found=true
-            disk_status="${vdev_status}"
-            break
-        fi
+        # Check each identifier to see if it appears in the pool
+        for identifier in "${identifiers[@]}"; do
+            # Look for this identifier in the zpool status output
+            local vdev_line
+            vdev_line=$(echo "${zpool_output}" | grep -E "\s+${identifier}(\s|$)" | head -1)
+            
+            if [[ -n "${vdev_line}" ]]; then
+                # Extract the status (second column)
+                disk_status=$(echo "${vdev_line}" | awk '{print $2}')
+                pool_found=true
+                break 2  # Break out of both loops
+            fi
+        done
     done
     
     if [[ "${pool_found}" != "true" ]]; then

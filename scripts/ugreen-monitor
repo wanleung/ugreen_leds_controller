@@ -1,4 +1,11 @@
-#!/usr/bin/bash
+#!/bin/bash
+
+# Ensure this script is running with bash (not sh or other shells)
+if [ -z "$BASH_VERSION" ]; then
+    echo "Error: This script requires bash to run properly."
+    echo "Please run with: bash $0 $*"
+    exit 1
+fi
 
 # UGREEN NAS Network and Disk Health Monitor
 # This script monitors network interfaces and disk S.M.A.R.T. status,

@@ -184,6 +184,9 @@ private:
     // Utility functions
     bool initializeLedController();
     bool loadI2cModules();
+    std::vector<std::string> getDeviceIdentifiers(const std::string& device_path);
+    std::map<std::string, std::string> buildGuidToDeviceMap();
+    ZfsDiskStatus parseZfsStatusFromOutput(const std::string& status_output, const std::string& identifier);
     std::string colorToString(const LedColor& color) const;
     LedColor stringToColor(const std::string& color_str) const;
     void logMessage(const std::string& message) const;

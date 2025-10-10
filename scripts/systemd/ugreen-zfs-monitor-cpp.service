@@ -1,0 +1,26 @@
+[Unit]
+Description=UGREEN NAS ZFS Pool and Disk Monitor (C++)
+Documentation=https://github.com/miskcoo/ugreen_leds_controller
+After=zfs-mount.service zfs-import.target
+Wants=zfs-import.target
+Requires=zfs-mount.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ugreen_zfs_monitor
+Restart=always
+RestartSec=15
+User=root
+Group=root
+
+# Environment settings
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/sys /dev
+
+[Install]
+WantedBy=multi-user.target

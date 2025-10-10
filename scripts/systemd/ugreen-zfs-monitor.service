@@ -7,7 +7,7 @@ Requires=zfs-mount.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ugreen-zfs-monitor
+ExecStart=/bin/bash /usr/local/bin/ugreen-zfs-monitor
 Restart=always
 RestartSec=15
 User=root

@@ -1,12 +1,12 @@
 [Unit]
-Description=UGREEN NAS Network and Disk Health Monitor
+Description=UGREEN NAS Network and Disk Health Monitor (C++)
 Documentation=https://github.com/miskcoo/ugreen_leds_controller
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash /usr/local/bin/ugreen-monitor
+ExecStart=/usr/local/bin/ugreen_monitor
 Restart=always
 RestartSec=10
 User=root
@@ -19,22 +19,7 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/run /var/log
-
-# Allow access to hardware
-DevicePolicy=closed
-DeviceAllow=/dev/i2c-* rw
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=ugreen-monitor
-
-# Process management
-KillMode=mixed
-KillSignal=SIGINT
-TimeoutStopSec=30
+ReadWritePaths=/sys /dev
 
 [Install]
 WantedBy=multi-user.target
