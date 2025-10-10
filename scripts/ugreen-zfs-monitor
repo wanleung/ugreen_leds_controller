@@ -217,7 +217,21 @@ check_zfs_pool_status() {
     elif echo "${status}" | grep -q "resilver in progress"; then
         scan_status="resilver"
     elif echo "${status}" | grep -q "scrub repaired.*with.*errors"; then
-        scan_status="scrub_errors"
+        # Check if scrub actually found and repaired errors (not just completed successfully)
+        scrub_line=$(echo "${status}" | grep "scrub repaired")
+        if echo "${scrub_line}" | grep -q "repaired 0B" && echo "${scrub_line}" | grep -q "with 0 errors"; then
+            # Successful scrub with no errors found - this is healthy
+            scan_status=""
+        elif ! echo "${scrub_line}" | grep -q "repaired 0B"; then
+            # Non-zero repair amount indicates actual errors were found and fixed
+            scan_status="scrub_errors"
+        elif ! echo "${scrub_line}" | grep -q "with 0 errors"; then
+            # Non-zero error count indicates problems were found
+            scan_status="scrub_errors"
+        else
+            # Default to healthy if we can't determine the scrub outcome
+            scan_status=""
+        fi
     fi
     
     # Determine status based on health and operations
@@ -615,10 +629,10 @@ monitor_scrub_resilver() {
         echo "Scrub/Resilver Status: Scrub in progress"
     elif [[ "${scrub_errors}" == "true" ]]; then
         update_led "${NETWORK_LED}" "${COLOR_SCRUB_PROGRESS}" 255
-        echo "Scrub/Resilver Status: Recent scrub found errors"
+        echo "Scrub/Resilver Status: Recent scrub found and repaired errors"
     else
         update_led "${NETWORK_LED}" "${COLOR_ONLINE}" 128
-        echo "Scrub/Resilver Status: Normal"
+        echo "Scrub/Resilver Status: All pools healthy"
     fi
 }
 
